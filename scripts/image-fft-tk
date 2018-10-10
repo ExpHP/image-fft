@@ -1,0 +1,511 @@
+#!/usr/bin/env python
+
+from __future__ import print_function, division
+
+import os
+import numpy as np
+import networkx as nx
+from collections import namedtuple
+import image_fft
+
+try:
+    # python 3
+    import tkinter
+    from tkinter import filedialog, messagebox
+except ImportError:
+    # python 2
+    import Tkinter as tkinter
+    import tkFileDialog as filedialog
+    import tkMessageBox as messagebox
+
+from PIL import Image, ImageTk
+
+PREVIEW_FRAME_PAD = 5
+
+def main():
+    root = tkinter.Tk()
+    root.geometry("800x600")
+
+    _app = Window(root)
+    root.mainloop()
+
+# Here, we are creating our class, Window, and inheriting from the Frame
+# class. Frame is a class from the tkinter module. (see Lib/tkinter/__init__)
+class Window(tkinter.Frame):
+    def __init__(self, master=None):
+        super(Window, self).__init__(master, padx=10, pady=10)
+        self.master = master
+        self.master.title("2D Image Fourier Transform")
+        self.pack(fill='both', expand=1)
+
+        infile_tkvar = tkinter.StringVar(None, os.path.expanduser('~'))
+        infile_frame = tkinter.Frame(self)
+        infile_label = tkinter.Label(infile_frame, text='Input file:')
+        infile_label.pack(side='left')
+        infile_entry = tkinter.Entry(infile_frame, textvariable=infile_tkvar)
+        infile_entry.pack(side='left')
+        infile_browse = tkinter.Button(infile_frame, text='Browse...')
+        infile_browse.pack(side='left')
+        infile_frame.pack(side='top', anchor='w')
+
+        # OptionMenus require string variables.
+        # I can't even begin to imagine how rough localization is in tkinter...
+        normalization_tkvar = tkinter.StringVar(None)
+        channel_tkvar = tkinter.StringVar(None)
+        output_tkvar = tkinter.StringVar(None)
+        exponent_tkvar = tkinter.DoubleVar(None, 1.0)
+        preview_zoom_tkvar = tkinter.DoubleVar(None, 1.0)
+
+        omenu_grid = tkinter.Frame(self)
+        channel_label = tkinter.Label(omenu_grid, text='Input channel')
+        normalization_label = tkinter.Label(omenu_grid, text='Normalization')
+        channel_omenu = tkinter.OptionMenu(omenu_grid, channel_tkvar, *CHANNEL_LABELS)
+        normalization_omenu = tkinter.OptionMenu(omenu_grid, normalization_tkvar, *MEAN_LABELS)
+        output_label = tkinter.Label(omenu_grid, text='Output func')
+        output_omenu = tkinter.OptionMenu(omenu_grid, output_tkvar, *OUTPUT_LABELS)
+        exponent_label = tkinter.Label(omenu_grid, text='Exponent')
+        exponent_slider = tkinter.Scale(omenu_grid, variable=exponent_tkvar, from_=0.01, to=3, resolution=0.01, digits=3, orient='horizontal')
+        channel_label.grid(row=0, column=0, sticky='e')
+        channel_omenu.grid(row=0, column=1, sticky='w', columnspan=3)
+        normalization_label.grid(row=1, column=0, sticky='e')
+        normalization_omenu.grid(row=1, column=1, sticky='w', columnspan=3)
+        output_label.grid(row=2, column=0, sticky='e')
+        output_omenu.grid(row=2, column=1, sticky='w', columnspan=1)
+        exponent_label.grid(row=3, column=0, sticky='e')
+        exponent_slider.grid(row=3, column=1, sticky='w', columnspan=1)
+
+        preview_tkvar = tkinter.IntVar(None, 1)
+        preview_checkbox = tkinter.Checkbutton(omenu_grid, text='Show preview', variable=preview_tkvar)
+        preview_checkbox.grid(row=2, column=2, columnspan=2, sticky='w')
+        #preview_checkbox.pack(side='top', anchor='w')
+        preview_zoom_label = tkinter.Label(omenu_grid, text='Preview zoom')
+        preview_zoom_slider = tkinter.Scale(omenu_grid, variable=preview_zoom_tkvar, from_=1.0, to=10.0, resolution=1, orient='horizontal')
+        preview_zoom_label.grid(row=3, column=2, sticky='e')
+        preview_zoom_slider.grid(row=3, column=3, sticky='w')
+
+        omenu_grid.pack(anchor='w', side='top')
+
+        # Defaults for these are set after creation, which ignores
+        # the initial value of the Vars
+        normalization_to_tkvar(normalization_tkvar, 'cap')
+        output_to_tkvar(output_tkvar, 'norm')
+        channel_to_tkvar(channel_tkvar, 'lum-a')
+
+        # FIXME should be in lower right of the window but there's a bug
+        # during resizing where stuff below the preview frame will get chopped
+        # off when you shrink the window (presumably because it does not realize
+        # the images will eagerly shrink themselves to fit the frame)
+        saveas_button = tkinter.Button(omenu_grid, text='Save as...')
+        saveas_button.grid(row=4, column=3, sticky='e')
+        #saveas_button.pack(side='top', anchor='w')
+
+        display_frame = tkinter.Frame(self, bd=1, relief='sunken', padx=PREVIEW_FRAME_PAD, pady=PREVIEW_FRAME_PAD)
+        display_img_label_1 = tkinter.Label(display_frame, text='no image to display')
+        display_img_label_2 = tkinter.Label(display_frame, text='no image to display')
+        display_img_label_1.pack(anchor='center', fill='both', expand=1)
+        display_frame.pack(fill='both', expand=1, side='top')
+
+        infile_browse.configure(command=lambda: self.browse_input_image())
+
+        self.exponent_tkvar = exponent_tkvar
+        self.infile_tkvar = infile_tkvar
+        self.preview_tkvar = preview_tkvar
+        self.preview_zoom_tkvar = preview_zoom_tkvar
+        self.normalization_tkvar = normalization_tkvar
+        self.channel_tkvar = channel_tkvar
+        self.output_tkvar = output_tkvar
+
+        self.saveas_button = saveas_button
+        self.display_frame = display_frame
+        self.display_img_label_1 = display_img_label_1
+        self.display_img_label_2 = display_img_label_2
+        self.preview_zoom_slider = preview_zoom_slider
+        self.current_preview_split_style = None
+
+        force_compute = self._setup_event_dag()
+        saveas_button.configure(command=lambda: self.saveas_dialog(force_compute))
+
+    def _setup_event_dag(self):
+        g = nx.DiGraph()
+        infile_raw = TkDaggy(g, self.infile_tkvar)
+        preview = TkDaggy(g, self.preview_tkvar)
+        normalization = TkDaggy(g, self.normalization_tkvar)
+        channel = TkDaggy(g, self.channel_tkvar)
+        exponent = TkDaggy(g, self.exponent_tkvar)
+        output_mode = TkDaggy(g, self.output_tkvar)
+        preview_zoom = TkDaggy(g, self.preview_zoom_tkvar)
+
+        normalization = normalization.map(lambda s: MEAN_KEYS[MEAN_LABELS.index(s)])
+        channel = channel.map(lambda s: CHANNEL_KEYS[CHANNEL_LABELS.index(s)])
+        output_mode = output_mode.map(lambda s: OUTPUT_KEYS[OUTPUT_LABELS.index(s)])
+
+        viewport_size = SimpleDaggy(g, None)
+
+        self.display_frame.bind('<Configure>', lambda e: viewport_size.set_value((
+            e.width - 2*PREVIEW_FRAME_PAD,
+            e.height - 2*PREVIEW_FRAME_PAD,
+        )))
+
+        #-----
+        # results of loading the input file
+        def image_load_result(infile_raw, preview):
+            error = None
+            if not preview:
+                # Show an error message, but load the file anyways
+                error = 'Preview disabled'
+
+            if os.path.isfile(infile_raw):
+                try:
+                    image = Image.open(infile_raw)
+                    print("Read '{}'".format(infile_raw))
+                    return (image, error)
+                except IOError as e:
+                    return (None, 'Error loading file:\n{!s}'.format(e))
+            raise NoChange
+        image_load_result = FunctionDaggy(g, image_load_result, infile_raw, preview)
+        image_load_result.set_value((None, 'No file loaded'))
+
+        input_image = image_load_result.map(lambda t: t[0])
+        image_load_error = image_load_result.map(lambda t: t[1])
+
+        def scalar_field(input_image, channel):
+            if not input_image: return None
+            return image_fft.get_input_scalar_field(input_image, channel)
+        scalar_field = FunctionDaggy(g, scalar_field, input_image, channel)
+
+        def scalar_image(scalar_field):
+            if scalar_field is None: return None
+            return image_fft.scalar_field_to_image(scalar_field)
+        scalar_image = FunctionDaggy(g, scalar_image, scalar_field)
+
+        def compute_out_image(scalar_field, normalization, exponent, output_mode):
+            return image_fft.compute_from_scalar_field(
+                scalar_field=scalar_field,
+                mean_mode=normalization,
+                exponent=exponent,
+                recenter=True,
+                output_mode=output_mode,
+            )
+
+        def output_image(scalar_field, normalization, exponent, output_mode, preview):
+            if scalar_field is None: return None
+            if not preview: raise NoChange
+            return compute_out_image(scalar_field, normalization, exponent, output_mode)
+        output_image = FunctionDaggy(
+            g, output_image,
+            scalar_field, normalization, exponent, output_mode, preview,
+        )
+
+        def display_output_image(output_image, preview_zoom):
+            if output_image is None: return None
+            return zoom_image(output_image, preview_zoom)
+        display_output_image = FunctionDaggy(g, display_output_image, output_image, preview_zoom)
+
+        # Some actual side-effectful update functions, which call Tkinter functions
+        # and are not depended on by anything else
+        FunctionDaggy(
+            g, self._show_images_or_error_in_preview,
+            scalar_image, display_output_image, image_load_error, viewport_size,
+        )
+
+        def callback(preview):
+            if preview:
+                self.preview_zoom_slider.configure(state = 'normal')
+            else:
+                self.preview_zoom_slider.configure(state = 'disabled')
+        FunctionDaggy(g, callback, preview)
+
+        def callback(input_image):
+            if input_image:
+                self.saveas_button.configure(state = 'normal')
+            else:
+                self.saveas_button.configure(state = 'disabled')
+        FunctionDaggy(g, callback, input_image)
+
+        # function to compute even if preview is disabled, so that Save As... works
+        def force_compute():
+            return compute_out_image(
+                scalar_field.value(), normalization.value(), exponent.value(), output_mode.value(),
+            )
+        return force_compute
+
+
+    def browse_input_image(self):
+        # in case somebody puts in e.g. /home/username then clicks the button,
+        # allow the current path itself to potentially be the initial directory
+        initialdir = self.infile_tkvar.get()
+        if not os.path.isdir(initialdir):
+            initialdir = os.path.dirname(initialdir)
+
+        path = filedialog.askopenfilename(
+            # FIXME: Any way to make it automatically select the file named by infile_tkvar?
+            initialdir = initialdir,
+            title = "Select file",
+            filetypes = IMAGE_TK_FILTERS,
+        )
+        if path: # empty string when canceled
+            self.infile_tkvar.set(path)
+
+    def saveas_dialog(self, compute_closure):
+        # (should only be called when the path is already valid)
+        initialdir = os.path.dirname(self.infile_tkvar.get())
+
+        path = filedialog.asksaveasfilename(
+            # FIXME: Any way to make it automatically select the file named by infile_tkvar?
+            initialdir = initialdir,
+            title = "Select file to save as",
+            filetypes = IMAGE_TK_FILTERS,
+        )
+        try:
+            if path: # empty string when canceled
+                image = compute_closure()
+                image.save(path)
+        # could be IOException, ValueException
+        except Exception as e:
+            messagebox.showerror(
+                title = "Error",
+                message = "An error occurred saving the file:\n\n{!s}".format(e),
+            )
+
+    def _show_images_or_error_in_preview(self, src_image, fft_image, error, viewport_size):
+        if error:
+            self._show_error_in_preview(error)
+        else:
+            self._show_images_in_preview(src_image, fft_image, viewport_size)
+
+    def _show_images_in_preview(self, src_image, fft_image, viewport_size):
+        display_size, split_style = aspect_preserving_resize_double(src_image.size, viewport_size)
+
+        tkimage_1 = ImageTk.PhotoImage(src_image.resize(display_size, Image.BICUBIC))
+        tkimage_2 = ImageTk.PhotoImage(fft_image.resize(display_size, Image.BICUBIC))
+
+        self.display_img_label_1.configure(image=tkimage_1)
+        self.display_img_label_2.configure(image=tkimage_2)
+        # Supposedly, setting the image attribute in addition to calling configure
+        # is necessary to avoid garbage collection.  Bizarre, but whatever.
+        self.display_img_label_1.image = tkimage_1
+        self.display_img_label_2.image = tkimage_2
+        self._set_preview_split_style(split_style)
+
+    def _show_error_in_preview(self, message):
+        self.display_img_label_1.configure(image='')
+        self.display_img_label_2.configure(image='')
+        self.display_img_label_1.configure(text=message)
+        self._set_preview_split_style('just-1')
+
+    def _set_preview_split_style(self, style):
+        if style == self.current_preview_split_style:
+            return
+
+        self.current_preview_split_style = style
+        self.display_img_label_1.pack_forget()
+        self.display_img_label_2.pack_forget()
+
+        if style == 'just-1':
+            self.display_img_label_1.pack(anchor='center', fill='both', expand=1)
+        elif style == 'hsplit':
+            self.display_img_label_1.pack(side='top', fill='both', expand=1)
+            self.display_img_label_2.pack(side='bottom', fill='both', expand=1)
+        elif style == 'vsplit':
+            self.display_img_label_1.pack(side='left', fill='both', expand=1)
+            self.display_img_label_2.pack(side='right', fill='both', expand=1)
+        else:
+            raise ValueError('bad split style: {}'.format(style))
+
+    def client_exit(self):
+        exit()
+
+#---------------------------------------------------------------------------
+# small embedded utility library for representing a tree of computed objects,
+# allowing code that updates state to be written in a somewhat more declarative manner
+
+class Daggy(object):
+    def __init__(self, g):
+        assert isinstance(g, nx.DiGraph)
+        self.graph = g
+        self.node = g.number_of_nodes()
+        g.add_node(self.node, obj=self)
+
+    def subscribe_to(self, upstream):
+        assert isinstance(upstream, Daggy)
+        assert upstream.graph is self.graph
+        self.graph.add_edge(upstream.node, self.node)
+
+    def invalidate(self):
+        """
+        Invalidate this node and all dependencies.
+        """
+        topological_order = reversed(list(nx.dfs_postorder_nodes(self.graph, self.node)))
+        for node in topological_order:
+            self.graph.nodes[node]['obj'].on_invalidate()
+
+    def value(self):
+        return None
+
+    def on_invalidate(self):
+        """
+        Callback to run when invalidated. It may assume that all dependent nodes have
+        already run their own callbacks.
+
+        This is the method derived classes should override; user code should not call it directly.
+        """
+        pass
+
+    def map(self, callback):
+        return FunctionDaggy(self.graph, callback, self)
+
+class SimpleDaggy(Daggy):
+    """ A daggy node you can read and write. """
+    def __init__(self, g, value=None):
+        super(SimpleDaggy, self).__init__(g)
+        self._value = value
+
+    def set_value(self, value):
+        self._value = value
+        self.invalidate()
+
+    def value(self):
+        return self._value
+
+class TkDaggy(Daggy):
+    """ A daggy node subscribed to a Tkinter variable. """
+    def __init__(self, g, tkvar):
+        super(TkDaggy, self).__init__(g)
+        self._tkvar = tkvar
+        self._value = None
+        tkvar.trace('w', lambda *args: self.invalidate())
+        self.on_invalidate()
+
+    def on_invalidate(self):
+        self._value = self._tkvar.get()
+
+    def value(self):
+        return self._value
+
+class NoChange(Exception):
+    """
+    May be raised by a FunctionDaggy callback to reuse the previously stored value
+    (which is already cached to meet the requirements of the Daggy API)
+    """
+    pass
+
+class FunctionDaggy(SimpleDaggy):
+    """
+    A daggy node that calls a function.
+
+    This is also a SimpleDaggy, so you can use ``set_value`` to set the initial value.
+    """
+    def __init__(self, g, callback, *daggy_args, **daggy_kw):
+        super(FunctionDaggy, self).__init__(g)
+        for upstream in daggy_args:
+            self.subscribe_to(upstream)
+        for upstream in daggy_kw.values():
+            self.subscribe_to(upstream)
+
+        self._daggy_args = daggy_args
+        self._daggy_kw = daggy_kw
+        self._callback = callback
+        self._value = None
+        self.on_invalidate()
+
+    def on_invalidate(self):
+        args = tuple(arg.value() for arg in self._daggy_args)
+        kw = { k: arg.value() for (k, arg) in self._daggy_kw.items() }
+        try:
+            self._value = self._callback(*args, **kw)
+        except NoChange:
+            pass
+
+    def value(self):
+        return self._value
+
+#---------------------------------------------------------------------------
+
+def normalization_to_tkvar(tkvar, s):
+    tkvar.set(MEAN_LABELS[MEAN_KEYS.index(s)])
+
+def channel_to_tkvar(tkvar, s):
+    tkvar.set(CHANNEL_LABELS[CHANNEL_KEYS.index(s)])
+
+def output_to_tkvar(tkvar, s):
+    tkvar.set(OUTPUT_LABELS[OUTPUT_KEYS.index(s)])
+
+def aspect_preserving_resize(original_size, viewport_size):
+    """ Find the optimal size of an image for a given viewport. """
+    orig_w, orig_h = original_size
+    port_w, port_h = viewport_size
+
+    scale = min(port_h / orig_h, port_w / orig_w)
+    return int(orig_w * scale), int(orig_h * scale)
+
+def aspect_preserving_resize_double(original_size, viewport_size):
+    """ Find the optimal size and arrangement of two identically-sized images in a given viewport. """
+    port_w, port_h = viewport_size
+
+    hsplit_size = aspect_preserving_resize(original_size, (port_w, port_h // 2))
+    vsplit_size = aspect_preserving_resize(original_size, (port_w // 2, port_h))
+
+    if hsplit_size[0] > vsplit_size[0]:
+        return (hsplit_size, 'hsplit')
+    else:
+        return (vsplit_size, 'vsplit')
+
+def zoom_image(pil_image, factor):
+    cur_size = np.array(pil_image.size)
+    cropped_size = cur_size // factor
+    cropped_min = (cur_size - cropped_size) // 2
+    cropped_max = cropped_min + cropped_size
+
+    # it wants left, upper, right, lower
+    box = cropped_min.tolist() + cropped_max.tolist()
+    cropped = pil_image.crop(box)
+
+    assert all(cropped.size == cropped_size)
+    return cropped.resize(cur_size)
+
+KeyPair = namedtuple('KeyPair', ['key', 'label'])
+
+# FIXME: PIL's gotta have a Tkinter-compatible list of its supported file types
+#        somewhere, right? I mean, it comes pre-packaged with Tkinter support...
+IMAGE_TK_FILTERS = [
+    ("PNG files", "*.png"),
+    ("BMP files", "*.bmp"),
+    ("JPEG files", "*.jpg *.jpeg"),
+    ("all files", "*.*"),
+]
+
+MEAN_CHOICES = [
+    KeyPair('keep', 'Keep mean (correct, but may have poor detail)'),
+    KeyPair('zero', 'Zero mean (enhances detail, leaves black dot)'),
+    KeyPair('cap', 'Clip mean (like Zero, without black dot)'),
+]
+MEAN_KEYS = [x.key for x in MEAN_CHOICES]
+MEAN_LABELS = [x.label for x in MEAN_CHOICES]
+
+CHANNEL_CHOICES = [
+    KeyPair('red', 'Red'),
+    KeyPair('green', 'Green'),
+    KeyPair('blue', 'Blue'),
+    KeyPair('lum-a', 'Luminance (standard)'),
+    KeyPair('lum-b', 'Luminance (Pillow)'),
+    KeyPair('lum-c', 'Luminance (Pillow, on squares)'),
+]
+CHANNEL_KEYS = [x.key for x in CHANNEL_CHOICES]
+CHANNEL_LABELS = [x.label for x in CHANNEL_CHOICES]
+
+OUTPUT_CHOICES = [
+    KeyPair('abs-real', 'Abs(Real)'),
+    KeyPair('abs-imag', 'Abs(Imag)'),
+    KeyPair('norm', 'Magnitude'),
+    KeyPair('complex', 'Complex (color)'),
+]
+OUTPUT_KEYS = [x.key for x in OUTPUT_CHOICES]
+OUTPUT_LABELS = [x.label for x in OUTPUT_CHOICES]
+
+
+if __name__ == '__main__':
+    main()
+else:
+    import sys
+    print('This module is an entry point and should not be imported!', file=sys.stderr)
+    sys.exit(1)
