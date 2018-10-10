@@ -149,7 +149,7 @@ def get_input_scalar_field(
     return luminance_floats
 
 def scalar_field_to_image(data):
-    import colorsys
+    from image_fft import np_colorsys
 
     if issubclass(data.dtype.type, np.floating):
         return Image.fromarray(byteify(data), 'L')
@@ -158,7 +158,7 @@ def scalar_field_to_image(data):
         hue = np.angle(data) / (2 * np.pi) % 1.0
         sat = 0.7 * (1-norm) + 1.0 * norm
         val = 0.0 * (1-norm) + 1.0 * norm
-        r,g,b = np.vectorize(colorsys.hsv_to_rgb)(hue, sat, val)
+        r,g,b = np_colorsys.hsv_to_rgb(hue, sat, val)
         float_data = np.array([r,g,b]).transpose(1, 2, 0) # -> (h, w, 3)
         return Image.fromarray(byteify(float_data), 'RGB')
     else:

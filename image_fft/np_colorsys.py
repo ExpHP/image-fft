@@ -1,5 +1,10 @@
 import numpy as np
 
+# Only faster than colorsys by about a factor of ~6-10.
+# Not as much as I was hoping for, but ehhh....
+#
+# I do have some images large enough where you can feel the difference.
+
 def rgb_to_hsv(r, g, b):
     # FIXME proper broadcasting
     r = np.array(r)
