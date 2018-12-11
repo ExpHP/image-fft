@@ -8,4 +8,4 @@ image-fft --help  # for a CLI interface
 image-fft-tk      # for a GUI
 ```
 
-![doc/Screenshot.png]
+![Screenshot](doc/Screenshot.png)
